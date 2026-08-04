@@ -1,13 +1,18 @@
-# mcp-gleif
+# @pipeworx/gleif
 
-GLEIF MCP — Global Legal Entity Identifier Foundation (free, no auth)
+Global Legal Entity Identifier Foundation MCP — LEI lookup and corporate hierarchy, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 673+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1394+ live data sources.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
+- `search_lei(query, country?, status?, page_size?)` — fuzzy entity-name search.
+- `get_lei(lei)` — full Level 1 record.
+- `get_lei_relationships(lei)` — Level 2 direct parent, ultimate parent, direct children.
+
+## Data source
+
+`https://api.gleif.org/api/v1/` — public JSON:API, no key required.
 
 ## Quick Start
 
@@ -23,7 +28,7 @@ Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 }
 ```
 
-Or connect to the full Pipeworx gateway for access to all 673+ data sources:
+Or connect to the full Pipeworx gateway for access to all 1394+ data sources:
 
 ```json
 {
@@ -47,7 +52,7 @@ The gateway picks the right tool and fills the arguments automatically.
 
 ## More
 
-- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [Docs and guides](https://pipeworx.io/docs)
 - [pipeworx.io](https://pipeworx.io)
 
 ## License
