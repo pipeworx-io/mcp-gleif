@@ -687,6 +687,11 @@ function collapse(s: string): string {
  * - lei_to_isins:         LEI (or name) -> ALL ISINs issued by that entity
  * - bic_to_lei:           SWIFT/BIC -> legal entity (GLEIF BIC-LEI mapping)
  * - lei_hierarchy_tree:   multi-hop ownership tree (ancestor chain + descendant BFS)
+ * - gleif_group_members:  whole consolidated group across jurisdictions, one call (fleet #2508)
+ * - gleif_lei_screen:     bulk screen by jurisdiction + status/event/date window (fleet #2508)
+ *
+ * The first seven tools call api.gleif.org. The last two answer from the GLEIF
+ * golden copy — see the "golden copy" section at the bottom of this file.
  *
  * Mapping gotchas (learned live 2026-08-16):
  * - filter[bic] matches 11-character BICs only — an 8-char head-office BIC
@@ -828,6 +833,56 @@ const tools: McpToolExport['tools'] = [
       required: ['lei'],
     },
   },
+  {
+    name: 'gleif_group_members',
+    description:
+      'Every entity in a corporate group, across all jurisdictions, in ONE call — built on the GLEIF golden copy (every Level 2 relationship record). Give any member of the group (LEI or company name): the tool climbs to the group\'s ultimate accounting-consolidation parent and returns every entity that reports it as ultimate parent, every descendant over direct-parent links, and the international branches of any of them. Aggregates are over the WHOLE group (member_count, jurisdiction_count, by_jurisdiction); the member list is capped by `limit` and says so. Each member carries depth below the root, direct_parent_lei, consolidation % where reported, jurisdiction and LEI status. ' +
+      'Answers "all subsidiaries of Siemens worldwide", "which countries does this group have legal entities in", "who is the ultimate parent of this company and what else does it own". Use this over lei_hierarchy_tree for large groups (that tool walks one node at a time and truncates at 150). Fund-management links (IS_FUND-MANAGED_BY / IS_SUBFUND_OF) are NOT ownership and are not included. Response carries data_as_of (the GLEIF publish time the answer reflects).',
+    summary: 'Every legal entity in a corporate group across jurisdictions, from the GLEIF golden copy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        lei: { type: 'string', description: 'A 20-character LEI of ANY group member, e.g. "W38RGI023J3WT1HWRP32" (Siemens AG), OR a company name, e.g. "Siemens" — resolved against the GLEIF entity register (a subsidiary match still lands on the whole group). Do not construct an LEI.' },
+        limit: { type: 'number', description: 'Max members to list, 1-2000 (default 300). Counts and by_jurisdiction always cover the whole group.' },
+      },
+      required: ['lei'],
+    },
+  },
+  {
+    name: 'gleif_lei_screen',
+    description:
+      'Bulk screen of LEI registrations in a jurisdiction across all ~3.4M LEIs in the GLEIF golden copy. Filter by registration status (LAPSED, RETIRED, ANNULLED, ISSUED ...), entity status, category, most recent legal-entity event (MERGERS_AND_ACQUISITIONS, ABSORPTION, DISSOLUTION, LIQUIDATION, CHANGE_LEGAL_NAME ...), a name fragment, and a lookback window in days. ' +
+      'Answers "which LEIs in Germany lapsed in the last 30 days", "Delaware entities retired this quarter", "UK entities with a merger event in the last 90 days", "new LEIs issued in Luxembourg this week". The window applies to status_date — the date the current status took effect: LAPSED = the renewal date that was missed, RETIRED/ANNULLED = entity expiration date (else last update), ISSUED = initial registration — or to the event date when event_type is given. Returns total (exact up to 100,000) plus a page of rows, newest first, with data_as_of. Sole-proprietor names are withheld (personal data); call get_lei for one record.',
+    summary: 'LEI registrations in a jurisdiction screened by status, event and date, from the GLEIF golden copy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jurisdiction: { type: 'string', description: 'Legal jurisdiction: ISO 3166-1 alpha-2 country ("DE", "GB", "US") or a subdivision ("US-DE", "CA-ON"). A country code includes its subdivisions. Common country names are converted.' },
+        registration_status: {
+          type: 'string',
+          description: 'LEI registration status. LAPSED = renewal missed (the company may still exist); RETIRED = the entity ceased, including by merger (pair with event_type to tell which).',
+          enum: ['ISSUED', 'LAPSED', 'RETIRED', 'ANNULLED', 'DUPLICATE', 'PENDING_TRANSFER', 'PENDING_ARCHIVAL'],
+        },
+        entity_status: { type: 'string', description: 'Legal entity status.', enum: ['ACTIVE', 'INACTIVE'] },
+        category: { type: 'string', description: 'Entity category.', enum: ['GENERAL', 'FUND', 'BRANCH', 'SOLE_PROPRIETOR', 'RESIDENT_GOVERNMENT_ENTITY', 'INTERNATIONAL_ORGANIZATION'] },
+        event_type: {
+          type: 'string',
+          description: 'The MOST RECENT legal-entity event recorded on the LEI (earlier events are not matched). When given, since_days applies to the event date instead of status_date. A merger shows up as RETIRED plus MERGERS_AND_ACQUISITIONS or ABSORPTION, and successor_lei names the survivor.',
+          enum: [
+            'MERGERS_AND_ACQUISITIONS', 'ABSORPTION', 'DEMERGER', 'SPINOFF', 'BREAKUP', 'ACQUISITION_BRANCH',
+            'DISSOLUTION', 'LIQUIDATION', 'BANKRUPTCY', 'INSOLVENCY', 'VOLUNTARY_ARRANGEMENT',
+            'CHANGE_LEGAL_NAME', 'CHANGE_OTHER_NAMES', 'CHANGE_LEGAL_FORM', 'CHANGE_LEGAL_ADDRESS', 'CHANGE_HQ_ADDRESS',
+            'TRANSFORMATION_UMBRELLA_TO_STANDALONE', 'TRANSFORMATION_STANDALONE_TO_UMBRELLA', 'TRANSFORMATION_SUBFUND_TO_STANDALONE',
+          ],
+        },
+        since_days: { type: 'number', description: 'Only entities whose status_date (or event date, with event_type) falls within the last N days, 1-3650.' },
+        name_contains: { type: 'string', description: 'Case-insensitive fragment of the legal or other name, at least 3 characters, e.g. "bank".' },
+        limit: { type: 'number', description: 'Rows per page, 1-500 (default 100).' },
+        offset: { type: 'number', description: 'Rows to skip for paging (default 0).' },
+      },
+      required: ['jurisdiction'],
+    },
+  },
 ];
 
 function reqStr(args: Record<string, unknown>, key: string, example: string): string {
@@ -862,6 +917,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         reqStr(args, 'lei', '"7LTWFZYICNSX8D621K86" or a company name'),
         args.depth as number | undefined,
       );
+    case 'gleif_group_members':
+      return groupMembers(gcDb(args), reqStr(args, 'lei', '"W38RGI023J3WT1HWRP32" or a company name like "Siemens"'), args.limit);
+    case 'gleif_lei_screen':
+      return leiScreen(gcDb(args), args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1711,6 +1770,265 @@ async function hierarchyTree(rawLei: string, rawDepth?: number) {
     ancestors,
     ultimate_parent,
     tree: root,
+  };
+}
+
+/* ───────────────────────── golden copy (fleet #2508) ─────────────────────────
+ * gleif_group_members and gleif_lei_screen answer from the GLEIF golden copy
+ * (relationship records + entity reference data) through RPCs defined in
+ * supabase/migrations/224_gleif_golden_copy.sql (filename only; not
+ * caller-visible). Every response carries data_as_of = the GLEIF publish time
+ * the answer reflects. Data is CC0 (GLEIF LEI Data Terms of Use, section II).
+ */
+
+interface GcDb {
+  url: string;
+  key: string;
+}
+
+type Row = Record<string, unknown>;
+
+function gcDb(args: Record<string, unknown>): GcDb {
+  const url = (args._supabaseUrl as string | undefined)?.trim();
+  const key = (args._supabaseKey as string | undefined)?.trim();
+  if (!url || !key) {
+    throw new Error(
+      'This tool is not configured on this deployment — an operator must enable its data credentials. This is a setup problem, not your arguments. ' +
+        'lei_hierarchy_tree (group structure) and search_lei (entity lookup) work without it.',
+    );
+  }
+  return { url, key };
+}
+
+async function gcRpc(db: GcDb, fn: string, body: Record<string, unknown>): Promise<unknown> {
+  const res = await pwFetch(`${db.url}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: {
+      apikey: db.key,
+      Authorization: `Bearer ${db.key}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await httpError(res, 'GLEIF golden copy');
+  return res.json();
+}
+
+interface DataAsOf {
+  relationships: string | null;
+  entities: string | null;
+  entities_complete: boolean;
+}
+
+function isoOrNull(v: unknown): string | null {
+  if (typeof v !== 'string' || !v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? v : d.toISOString();
+}
+
+async function gcDataAsOf(db: GcDb): Promise<DataAsOf> {
+  const raw = (await gcRpc(db, 'gleif_data_as_of', {})) as Row | null;
+  return {
+    relationships: isoOrNull(raw?.rr),
+    entities: isoOrNull(raw?.lei2),
+    entities_complete: raw?.lei2_full_loaded === true,
+  };
+}
+
+function asOfBlock(a: DataAsOf) {
+  return {
+    data_as_of: { relationships: a.relationships, entities: a.entities },
+    source: 'GLEIF golden copy (CC0), refreshed daily',
+    ...(a.entities_complete
+      ? {}
+      : {
+          coverage_warning:
+            'GLEIF entity reference data is still being populated on this deployment, so some names, jurisdictions and statuses are missing. This is a deployment state, not a problem with your query.',
+        }),
+  };
+}
+
+function clampInt(v: unknown, lo: number, hi: number, dflt: number): number {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(hi, Math.max(lo, Math.round(n)));
+}
+
+/** LEI or name -> LEI, resolved against the golden-copy entity data first, the GLEIF API second. */
+async function resolveGc(
+  db: GcDb,
+  value: string,
+): Promise<{ lei: string; resolved?: Record<string, unknown> }> {
+  const v = value.trim();
+  if (LEI_SHAPE.test(v)) return resolveLei(v); // checksum-validated, no lookup
+  const rows = (await gcRpc(db, 'gleif_name_search', { p_query: v, p_limit: 5 })) as Row[];
+  if (Array.isArray(rows) && rows.length && typeof rows[0].lei === 'string') {
+    const best = rows[0];
+    return {
+      lei: best.lei as string,
+      resolved: {
+        resolved_from: v,
+        lei: best.lei,
+        legal_name: best.legal_name ?? null,
+        jurisdiction: best.jurisdiction ?? null,
+        match_mode: best.match ?? null,
+        other_candidates: rows.slice(1).map((r) => ({ lei: r.lei, legal_name: r.legal_name, jurisdiction: r.jurisdiction })),
+      },
+    };
+  }
+  // No match (or entity data still populating): fall back to GLEIF's own
+  // name search, which retries without legal-form suffixes.
+  return resolveLei(v);
+}
+
+async function groupMembers(db: GcDb, rawLei: string, rawLimit: unknown) {
+  const limit = clampInt(rawLimit, 1, 2000, 300);
+  const asOf = await gcDataAsOf(db);
+  if (!asOf.relationships) {
+    throw new Error(
+      'Group data is not available on this deployment yet. This is a deployment state, not your arguments. ' +
+        'lei_hierarchy_tree answers the same question node by node (depth- and node-limited).',
+    );
+  }
+  const { lei, resolved } = await resolveGc(db, rawLei);
+  const tree = (await gcRpc(db, 'gleif_ownership_tree', { p_lei: lei, p_limit: limit })) as Row | null;
+  if (!tree || typeof tree !== 'object') {
+    throw new Error('GLEIF golden copy: the group query returned no result — treating this as a failure rather than an empty group.');
+  }
+  if (tree.queried_found !== true) {
+    throw new Error(
+      `user_error: LEI ${lei} is not in the GLEIF golden copy (as of ${asOf.entities ?? asOf.relationships}). ` +
+        'If it was issued in the last few hours, call get_lei. If you constructed this code, pass the company NAME instead.',
+    );
+  }
+  const memberCount = Number(tree.member_count ?? 0);
+  const returned = Number(tree.members_returned ?? 0);
+  return {
+    lei,
+    ...(resolved ? { resolved_from_name: resolved } : {}),
+    root: tree.root,
+    root_basis: tree.root_basis,
+    ancestors_of_queried: tree.ancestors_of_queried,
+    member_count: memberCount,
+    subsidiary_count: tree.subsidiary_count,
+    branch_count: tree.branch_count,
+    jurisdiction_count: tree.jurisdiction_count,
+    by_jurisdiction: tree.by_jurisdiction,
+    members_returned: returned,
+    truncated: returned < memberCount,
+    ...(returned < memberCount
+      ? { truncation_note: `Listing ${returned} of ${memberCount} members (limit ${limit}, max 2000). Counts and by_jurisdiction cover the whole group.` }
+      : {}),
+    ...(memberCount === 0
+      ? {
+          note:
+            tree.root_basis === 'queried_entity_has_no_reported_parent'
+              ? 'No entity reports this LEI as its parent, and it reports no parent of its own in GLEIF Level 2 data. Many entities file a reporting exception instead (e.g. parent is a natural person, or not consolidated) — get_lei_relationships shows the live record.'
+              : 'The group root has no other reported members.',
+        }
+      : {}),
+    members: tree.members,
+    ...asOfBlock(asOf),
+  };
+}
+
+const SCREEN_REG = new Set(['ISSUED', 'LAPSED', 'RETIRED', 'ANNULLED', 'DUPLICATE', 'PENDING_TRANSFER', 'PENDING_ARCHIVAL']);
+const SCREEN_ENTITY = new Set(['ACTIVE', 'INACTIVE']);
+const SCREEN_CATEGORY = new Set(['GENERAL', 'FUND', 'BRANCH', 'SOLE_PROPRIETOR', 'RESIDENT_GOVERNMENT_ENTITY', 'INTERNATIONAL_ORGANIZATION']);
+
+function optEnum(args: Record<string, unknown>, key: string, allowed: Set<string>): string | null {
+  const v = args[key];
+  if (v === undefined || v === null || v === '') return null;
+  const s = String(v).trim().toUpperCase();
+  if (s === 'MERGED' && key === 'registration_status') {
+    throw new Error(
+      'user_error: GLEIF records a merged entity as registration_status RETIRED, not MERGED (no golden-copy LEI carries MERGED). ' +
+        'Pass registration_status "RETIRED" with event_type "MERGERS_AND_ACQUISITIONS" or "ABSORPTION"; successor_lei names the survivor.',
+    );
+  }
+  if (!allowed.has(s)) {
+    throw new Error(`user_error: ${key} "${v}" is not one of ${[...allowed].join(', ')}.`);
+  }
+  return s;
+}
+
+function normalizeJurisdiction(raw: string): string {
+  const t = raw.trim();
+  const m = /^([A-Za-z]{2})-([A-Za-z0-9]{1,3})$/.exec(t);
+  if (m) return `${m[1].toUpperCase()}-${m[2].toUpperCase()}`;
+  return normalizeCountry(t); // alpha-2, alpha-3 or a common country name; throws otherwise
+}
+
+async function leiScreen(db: GcDb, args: Record<string, unknown>) {
+  const jurisdiction = normalizeJurisdiction(reqStr(args, 'jurisdiction', '"DE", "GB" or "US-DE"'));
+  const registration_status = optEnum(args, 'registration_status', SCREEN_REG);
+  const entity_status = optEnum(args, 'entity_status', SCREEN_ENTITY);
+  const category = optEnum(args, 'category', SCREEN_CATEGORY);
+  const eventRaw = args.event_type;
+  const event_type = eventRaw === undefined || eventRaw === null || eventRaw === '' ? null : String(eventRaw).trim().toUpperCase();
+  if (event_type && !/^[A-Z_]{3,60}$/.test(event_type)) {
+    throw new Error(`user_error: event_type "${eventRaw}" is not a GLEIF legal-entity event type, e.g. MERGERS_AND_ACQUISITIONS, DISSOLUTION.`);
+  }
+  const since_days = args.since_days === undefined || args.since_days === null || args.since_days === '' ? null : clampInt(args.since_days, 1, 3650, 30);
+  const nameRaw = typeof args.name_contains === 'string' ? args.name_contains.trim() : '';
+  if (nameRaw && nameRaw.length < 3) {
+    throw new Error('user_error: name_contains needs at least 3 characters.');
+  }
+  const limit = clampInt(args.limit, 1, 500, 100);
+  const offset = clampInt(args.offset, 0, 1_000_000, 0);
+
+  const asOf = await gcDataAsOf(db);
+  if (!asOf.entities) {
+    throw new Error(
+      'LEI screening is not available on this deployment yet. This is a deployment state, not your arguments. ' +
+        'search_lei can filter one name by country and status in the meantime.',
+    );
+  }
+  const out = (await gcRpc(db, 'gleif_screen', {
+    p_jurisdiction: jurisdiction,
+    p_registration_status: registration_status,
+    p_entity_status: entity_status,
+    p_category: category,
+    p_since_days: since_days,
+    p_event_type: event_type,
+    p_name_contains: nameRaw || null,
+    p_limit: limit,
+    p_offset: offset,
+  })) as Row | null;
+  if (!out || !Array.isArray(out.rows)) {
+    throw new Error('GLEIF golden copy: the screen returned no row set — treating this as a failure rather than zero matches.');
+  }
+  const rows = out.rows as Row[];
+  const total = Number(out.total ?? 0);
+  const filters = {
+    jurisdiction,
+    ...(registration_status ? { registration_status } : {}),
+    ...(entity_status ? { entity_status } : {}),
+    ...(category ? { category } : {}),
+    ...(event_type ? { event_type } : {}),
+    ...(since_days ? { since_days, window_field: event_type ? 'last_event_date' : 'status_date' } : {}),
+    ...(nameRaw ? { name_contains: nameRaw } : {}),
+  };
+  return {
+    filters,
+    total,
+    total_is_floor: out.total_is_floor === true,
+    returned: rows.length,
+    offset,
+    ...(offset + rows.length < total ? { next_offset: offset + rows.length } : {}),
+    ...(total === 0
+      ? {
+          note:
+            `No LEI in the GLEIF golden copy (as of ${asOf.entities}) matches all of these filters. That is a real zero, not an error. ` +
+            'Widen since_days, drop a filter, or pass the country code alone (it includes subdivisions like US-DE). event_type matches only the MOST RECENT event on each LEI.',
+        }
+      : {}),
+    ...(rows.some((r) => r.category === 'SOLE_PROPRIETOR')
+      ? { personal_data_note: 'Sole-proprietor names and cities are withheld in bulk results (they name individuals). get_lei returns a single record.' }
+      : {}),
+    rows,
+    ...asOfBlock(asOf),
   };
 }
 
