@@ -1811,7 +1811,32 @@ async function gcRpc(db: GcDb, fn: string, body: Record<string, unknown>): Promi
     },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw await httpError(res, 'GLEIF golden copy');
+  if (!res.ok) {
+    // PostgREST's error envelope carries the real SQLSTATE in `code` (e.g.
+    // "57014" = statement_timeout on OUR query, not a vendor outage). The
+    // generic httpError()/summarizeErrorBody() path keeps only the human
+    // `message` field and drops `code` — the same gap fleet #1109 found and
+    // fixed in shared/src/dockets.ts. Without the SQLSTATE surviving into the
+    // thrown message, internalDbMetricsClass() (shared/src/internal-db-class.ts)
+    // can't see it, so this booked as the coarser internal_service_unreachable
+    // (fleet #1096's host-based fallback) instead of the precise
+    // internal_db_timeout (fleet #2705) — the gateway classifier at
+    // workers/gateway/src/index.ts prefers internalDbMetricsClass whenever it
+    // matches. Read the SQLSTATE here, before the summary drops it, and cite
+    // it in the "(Postgres NNNNN)" form internal-db-class.ts's
+    // prosePostgresCode() looks for — same pattern as dockets.ts's "(Postgres
+    // 57014)". The caller-facing wording is otherwise unchanged.
+    const raw = await res.text().catch(() => '');
+    const sqlstate = raw.match(/"code"\s*:\s*"([0-9][0-9A-Z]{4})"/)?.[1];
+    const detail = summarizeErrorBody(raw);
+    throw new Error(
+      markInternalOrigin(
+        `GLEIF golden copy: ${res.status}${detail ? ` — ${detail}` : ''}${sqlstate ? ` (Postgres ${sqlstate})` : ''}`,
+        res.url,
+        res.status,
+      ),
+    );
+  }
   return res.json();
 }
 
