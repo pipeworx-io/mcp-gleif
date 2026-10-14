@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gleif",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "GLEIF MCP — Global Legal Entity Identifier Foundation (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-778d09eb3513dbc01a51f0da30f587ca1990a015882f90e30be652fd44a04b25",
-    "sourceCommit": "211a6d307878cf994dd13cc72b7c2921b47759a7"
+    "sourceHash": "v1-626c55e42d73d8f68490b543ae00e1d6af8ea966c839d311ccc140dadebc3191",
+    "sourceCommit": "4f465027cf3de54acf4976d8118ae3423a8ec9fa"
   }
 }

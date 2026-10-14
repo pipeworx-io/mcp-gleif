@@ -1310,7 +1310,20 @@ async function searchLei(query: string, country?: string, status?: string, pageS
   };
   results.sort((a, b) => score(a) - score(b));
 
-  const exact = results.find((r) => normName(r.legal_name ?? '') === wanted) ?? null;
+  // EVERY record whose registered legal name matches, not the first one
+  // (fleet #3052). `.find()` here was a silent coin flip: two DISTINCT legal
+  // entities are both registered under the exact name "AXA"
+  // (9695007ZQTEMPGIL5N67 and F5WCUMTUM4RKZ1MAIE39, both FR, measured live
+  // 2026-10-14), so `exact_legal_name_match` named whichever GLEIF happened to
+  // list first and nothing in the response said a rival existed. A caller
+  // asking the same question twice could be handed a different company.
+  //
+  // A tie is DECLINED rather than broken. There is no tiebreak available that
+  // is evidence rather than preference — neither record is more "the" AXA than
+  // the other — and inventing one (lowest LEI, newest registration) would just
+  // make the coin flip deterministic while keeping it wrong half the time.
+  const exactAll = results.filter((r) => normName(r.legal_name ?? '') === wanted);
+  const exact = exactAll.length === 1 ? exactAll[0] : null;
 
   const notes: string[] = [];
   if (countryDropped) {
@@ -1319,6 +1332,14 @@ async function searchLei(query: string, country?: string, status?: string, pageS
         `was dropped and these are the unrestricted matches. GLEIF stores the country of the ` +
         `REGISTERED legal address, which is often not where the entity operates — read ` +
         `legal_address and jurisdiction on each result before treating one as the entity you meant.`,
+    );
+  }
+  if (exactAll.length > 1) {
+    notes.push(
+      `${exactAll.length} DISTINCT legal entities are registered under the exact name "${query}", so no single LEI is ` +
+        `asserted: ${exactAll.map((r) => `${r.lei} (${r.jurisdiction ?? r.legal_address?.country ?? '??'}, entity ${r.entity_status ?? '?'}, LEI ${r.registration_status ?? '?'})`).join('; ')}. ` +
+        `They are listed under \`exact_legal_name_ties\` and first in \`results\` — read jurisdiction, status and address to pick, ` +
+        `or pass \`country\` to narrow. A name being exact does not make it unique.`,
     );
   }
   if (matchMode === 'legal_name_relaxed' || matchMode === 'fuzzy') {
@@ -1345,7 +1366,26 @@ async function searchLei(query: string, country?: string, status?: string, pageS
     // the rows came from merging several rewrites or from the fuzzy index, where a
     // single "total" would be a fiction.
     total: totalMatching,
+    // Null when the exact name is shared by more than one entity — see the
+    // tie note above. `exact_legal_name_ties` is how a caller tells that case
+    // ("several, so we refuse to pick") from a plain miss ("none"), which is
+    // the distinction a single null cannot carry.
     exact_legal_name_match: exact ? { lei: exact.lei, legal_name: exact.legal_name } : null,
+    ...(exactAll.length > 1
+      ? {
+          exact_legal_name_ties: exactAll.map((r) => ({
+            lei: r.lei,
+            legal_name: r.legal_name,
+            jurisdiction: r.jurisdiction ?? null,
+            // Both statuses, because they answer different questions: the
+            // company's own lifecycle, and whether anyone still maintains its
+            // LEI record. A lapsed LEI on a live company is common.
+            entity_status: r.entity_status ?? null,
+            registration_status: r.registration_status ?? null,
+            legal_address: r.legal_address,
+          })),
+        }
+      : {}),
     results,
   };
 }
