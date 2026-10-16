@@ -1452,10 +1452,75 @@ function leiChecksumOk(lei: string): boolean {
   return rem === 1;
 }
 
+/**
+ * A national-register id embedded in free text alongside the company name —
+ * "Klarna Bank AB (Swedish org. no. 556737-0431)", "Klarna Bank AB, company
+ * registration number 556737-0431" — fleet #3182. Pulled out so the BARE
+ * legal name goes to GLEIF's whole-token name index (which has no idea what
+ * "org. no." means and returns zero rows if it is left in), while the digits
+ * are kept to match against each candidate's own `registeredAs`.
+ */
+const REG_CLAUSE_RE =
+  /[,(]?\s*(?:swedish|norwegian|danish|finnish|french|german|dutch|italian|spanish|british|uk|u\.k\.|us|u\.s\.|irish|belgian)?\s*(?:company\s+)?(?:org(?:anisation|ization)?s?|orgnr|registration|reg|company)\.?\s*(?:no\.?|number|nr\.?)?\s*[:#]?\s*([0-9][0-9 \-./]{3,14}[0-9])\s*\)?/i;
+
+function extractRegistrationNumber(raw: string): { name: string; regNumber: string | null } {
+  const m = raw.match(REG_CLAUSE_RE);
+  if (!m) return { name: raw, regNumber: null };
+  const digits = m[1] ?? '';
+  const regNumber = registerId(digits) ?? digits.replace(/\s+/g, '');
+  const name = raw.replace(REG_CLAUSE_RE, '').replace(/[,\s]+$/, '').trim();
+  return { name: name || raw, regNumber };
+}
+
+/** Does this LEI have ANY Level 2 relationship record — a direct parent, an
+ *  ultimate parent, or at least one direct child? A standalone entity
+ *  legitimately has none of these, so this is never used as a liveness check
+ *  on its own. Among two SAME-NAME records it IS evidence (fleet #3182): a
+ *  bank's own foreign branch is issued under the identical registered legal
+ *  name as the bank itself, but GLEIF does not carry Level 2 relationship
+ *  data for branches the way it does for the entity they belong to — Klarna
+ *  Bank AB's French branch (9845004D5B14SCBE7459) 404s on all three, the
+ *  bank (549300O3HXYXXUHR0897) does not. */
+async function probeHasRelationships(lei: string): Promise<boolean> {
+  const [direct, ultimate, children] = await Promise.all([
+    gleifFetch(`/lei-records/${encodeURIComponent(lei)}/direct-parent`).catch(() => null),
+    gleifFetch(`/lei-records/${encodeURIComponent(lei)}/ultimate-parent`).catch(() => null),
+    gleifFetch(`/lei-records/${encodeURIComponent(lei)}/direct-children?page[size]=1`).catch(() => null),
+  ]);
+  const hasRecord = (resp: unknown): boolean => {
+    if (!resp) return false;
+    const d = (resp as { data?: unknown }).data;
+    return Array.isArray(d) ? d.length > 0 : d != null;
+  };
+  return hasRecord(direct) || hasRecord(ultimate) || hasRecord(children);
+}
+
+type SearchResult = {
+  lei?: string;
+  legal_name?: string | null;
+  entity_status?: string | null;
+  registered_as?: string | null;
+  jurisdiction?: string | null;
+  initial_registration?: string | null;
+};
+
 // Accept a company NAME as well as an LEI. Nobody has a 20-character LEI to
 // hand, so a model asked for corporate hierarchy will invent one or pass the
 // name — and the name went straight into the URL path, where GLEIF 404s it and
 // the .catch(() => null) below turned that into "no relationships".
+//
+// fleet #3182: GLEIF can have SEVERAL active, issued records sharing the
+// exact same registered legal name — "Klarna Bank AB" names both the bank
+// (549300O3HXYXXUHR0897) and its own French branch (9845004D5B14SCBE7459),
+// which inherits the parent's name but carries its own local registeredAs and
+// has no Level 2 relationship data of its own. `.find(ACTIVE) ?? items[0]`
+// picked whichever GLEIF listed first — the branch, here — and the caller was
+// told "no recorded ultimate parent", which is true of the branch and false
+// of the bank. Fixed by (1) matching a registration number the caller supplied
+// against `registeredAs` first, (2) among same-name records otherwise ranking
+// deterministically — Level 2 relationship data present, then oldest initial
+// registration — never by GLEIF's listing order, and (3) always disclosing how
+// many same-name records existed and which one was NOT chosen.
 async function resolveLei(value: string): Promise<{ lei: string; resolved?: Record<string, unknown> }> {
   const v = value.trim();
   if (LEI_SHAPE.test(v)) {
@@ -1469,14 +1534,70 @@ async function resolveLei(value: string): Promise<{ lei: string; resolved?: Reco
     }
     return { lei: v.toUpperCase() };
   }
-  const found = (await searchLei(v, undefined, undefined, 10)) as {
-    results?: { lei?: string; legal_name?: string; entity_status?: string }[];
+
+  const { name: namePart, regNumber } = extractRegistrationNumber(v);
+  const found = (await searchLei(namePart, undefined, undefined, 10)) as {
+    results?: SearchResult[];
     match_mode?: string;
   };
   const items = found.results ?? [];
+  if (!items.length) {
+    throw new Error(`user_error: No LEI record matches "${v}". Use gleif search_lei to see candidates.`);
+  }
+
   // searchLei already ranks exact legal-name matches first; prefer an ACTIVE
   // entity among them, since a dissolved namesake is the likeliest wrong pick.
-  const best = items.find((r) => r.entity_status === 'ACTIVE') ?? items[0];
+  const activeItems = items.filter((r) => r.entity_status === 'ACTIVE');
+  const pool = activeItems.length ? activeItems : items;
+  const wanted = normName(namePart);
+  // EVERY record whose registered legal name matches, not the first one —
+  // same reasoning as search_lei's own exact_legal_name_ties (fleet #3052),
+  // but resolveLei feeds tools that have to land on ONE lei, so a tie here is
+  // ranked rather than declined.
+  const ties = pool.filter((r) => normName(r.legal_name ?? '') === wanted);
+
+  let best: SearchResult | undefined = ties[0] ?? pool[0];
+  let ambiguity: Record<string, unknown> | undefined;
+
+  if (ties.length > 1) {
+    let chosen = regNumber
+      ? ties.find((r) => {
+          const ra = r.registered_as ?? '';
+          return (registerId(ra) ?? ra.replace(/\s+/g, '')) === regNumber;
+        })
+      : undefined;
+    let reason: string;
+    if (chosen) {
+      reason = `the registration number ${regNumber} given with the query matches this record's registeredAs, and no other same-name record's does`;
+    } else {
+      const flags = await Promise.all(ties.map((r) => (r.lei ? probeHasRelationships(r.lei) : Promise.resolve(false))));
+      const withData = ties.filter((_, i) => flags[i]);
+      const rankPool = withData.length ? withData : ties;
+      // Oldest initial_registration first; a record with no date on file is
+      // ranked last rather than first (an empty string must not win a
+      // lexical sort by looking like the earliest possible date).
+      const byAge = rankPool
+        .slice()
+        .sort((a, b) => (a.initial_registration || '9999-99-99').localeCompare(b.initial_registration || '9999-99-99'));
+      chosen = byAge[0];
+      reason = withData.length
+        ? `it has Level 2 relationship data on record (a parent, ultimate parent, or subsidiary) while ${withData.length < ties.length ? 'the other same-name record does not' : `it is the oldest-registered of ${withData.length} same-name records that do`}`
+        : `neither same-name record has Level 2 relationship data on record; chosen as the oldest-registered (initial registration ${chosen?.initial_registration ?? 'unknown'})`;
+    }
+    best = chosen ?? best;
+    const others = ties.filter((r) => r.lei !== best!.lei);
+    ambiguity = {
+      // How many same-name records existed, never resolved silently (fleet #3182).
+      same_name_records: ties.length,
+      chosen_because: reason,
+      other_same_name_records: others.map((r) => ({
+        lei: r.lei ?? null,
+        registered_as: r.registered_as ?? null,
+        jurisdiction: r.jurisdiction ?? null,
+      })),
+    };
+  }
+
   if (!best?.lei) {
     throw new Error(`user_error: No LEI record matches "${v}". Use gleif search_lei to see candidates.`);
   }
@@ -1491,6 +1612,8 @@ async function resolveLei(value: string): Promise<{ lei: string; resolved?: Reco
       // exact legal-name hit or a fuzzy guess. A caller acting on a hierarchy
       // needs to see that, not just the LEI it landed on.
       match_mode: found.match_mode ?? null,
+      ...(regNumber ? { registration_number_given: regNumber } : {}),
+      ...(ambiguity ?? {}),
     },
   };
 }
