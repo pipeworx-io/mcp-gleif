@@ -2,12 +2,26 @@
 
 Global Legal Entity Identifier Foundation MCP — LEI lookup, ISIN/BIC-to-entity mapping, and corporate hierarchy, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1800+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1815+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `search_lei(query, country?, status?, page_size?)` — fuzzy entity-name search. If `country` narrows the result to nothing, the filter is dropped and the response says so via `country_filter_dropped` — GLEIF filters on the *registered legal address*, which often is not where the entity operates (no Sberbank-named record has a Russian one; they sit in CY/SK/LU/GB).
 - `get_lei(lei)` — full Level 1 record: legal name, addresses, jurisdiction, legal form, and LEI registration status. Accepts a company **name** as well as a 20-character LEI; a resolved name is echoed back as `resolved_from_name`.
+
+**`registered_as` + `registration_authority` (on `get_lei` and every
+`search_lei` result).** The company's id in its OWN national business register,
+and the code of that register — `RA000585` UK Companies House, `RA000189` INSEE
+Sirene, `RA000413` Japan NTA, `RA000472` Brønnøysund. This is what ties an LEI
+to a national-register record *by key* rather than by name similarity (the name
+route is what resolved "Porsche" to a Martinique entity). An id is only unique
+within its register, so always read the pair. Two things to know: GLEIF
+publishes some registers' ids with spaces inside them (Equinor's Norwegian
+orgnr arrives as `923 609 016`) and this pack strips all whitespace so the id
+joins — nothing else is changed, because `-`, `.`, `_` and `/` are part of how
+those registers format their own ids; and `RA999999` is GLEIF's "other / not
+applicable" sentinel, which never carries an id (0 of 201 in a sampled daily
+delta). Null when GLEIF publishes no id — ~7.5% of records.
 - `get_lei_relationships(lei)` — Level 2 direct parent, ultimate parent, direct children (one hop).
 - `isin_to_lei(isin)` — resolve a security's ISIN to the legal entity that issued it (LEI + legal name). A valid-but-unmapped ISIN is reported as `mapped: false, reason: "isin_unmapped"` — the mapping lags new issuance, so unmapped ≠ nonexistent.
 - `lei_to_isins(lei)` — all ISINs issued by an entity (LEI or company name accepted). Returns the full set — one entity issues many securities.
@@ -84,7 +98,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1800+ data sources. The
+Both URLs reach the same gateway and the same 1815+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -950,6 +950,8 @@ interface LeiRecord {
       jurisdiction?: string;
       category?: string;
       legalForm?: { id?: string; other?: string };
+      registeredAs?: string;
+      registeredAt?: { id?: string; other?: string };
       status?: string;
     };
     registration?: {
@@ -969,6 +971,23 @@ interface LeiRecord {
   };
 }
 
+/** A national register id in canonical formatting: ALL whitespace removed.
+ *
+ *  GLEIF publishes some registers' ids spaced — Equinor's Norwegian orgnr comes
+ *  back as "923 609 016" (RA000472), Cypriot ids as "HE 367908" (RA000161) —
+ *  and a spaced id joins to nothing. Measured on the 2026-10-15 16:00 intraday
+ *  delta, 659 of 3,171 records carry whitespace inside the id. Nothing else is
+ *  touched: '-', '.', '_' and '/' are how those registers format their own ids,
+ *  so stripping them would break joins rather than make them. The identical
+ *  rule runs in scripts/gleif-transform.py (register_id) so the Supabase mirror
+ *  and this live proxy return ONE string for the same company, not two.
+ */
+export function registerId(v?: string): string | null {
+  if (!v) return null;
+  const out = v.replace(/\s+/g, '');
+  return out || null;
+}
+
 function normalizeRecord(r: LeiRecord) {
   const a = r.attributes ?? {};
   const e = a.entity ?? {};
@@ -979,6 +998,15 @@ function normalizeRecord(r: LeiRecord) {
     jurisdiction: e.jurisdiction ?? null,
     category: e.category ?? null,
     legal_form: e.legalForm?.id ?? e.legalForm?.other ?? null,
+    // The company's id in its OWN national register, and the code of that
+    // register (RA000585 = UK Companies House, RA000189 = INSEE Sirene,
+    // RA000413 = Japan NTA, RA000472 = Brønnøysund). This is the one field that
+    // ties an LEI to a national-register record BY KEY instead of by name
+    // similarity — the name route is what resolved "Porsche" to a Martinique
+    // entity. RA999999 is GLEIF's "other / not applicable" sentinel and never
+    // carries an id (0 of 201 in the sampled delta). fleet #3022.
+    registered_as: registerId(e.registeredAs),
+    registration_authority: e.registeredAt?.id ?? e.registeredAt?.other ?? null,
     entity_status: e.status ?? null,
     registration_status: a.registration?.status ?? null,
     initial_registration: a.registration?.initialRegistrationDate ?? null,
