@@ -689,9 +689,16 @@ function collapse(s: string): string {
  * - lei_hierarchy_tree:   multi-hop ownership tree (ancestor chain + descendant BFS)
  * - gleif_group_members:  whole consolidated group across jurisdictions, one call (fleet #2508)
  * - gleif_lei_screen:     bulk screen by jurisdiction + status/event/date window (fleet #2508)
+ * - decode_elf_code:      ISO 20275 Entity Legal Form code -> name/country/jurisdiction (fleet #3255)
+ * - decode_registration_authority: GLEIF RA code -> national register name/website/jurisdiction (fleet #3255)
  *
- * The first seven tools call api.gleif.org. The last two answer from the GLEIF
- * golden copy — see the "golden copy" section at the bottom of this file.
+ * The first seven tools, plus the two decoders, call api.gleif.org. gleif_group_members
+ * and gleif_lei_screen answer from the GLEIF golden copy — see the "golden copy" section
+ * at the bottom of this file.
+ *
+ * get_lei decodes its own legal_form and registration_authority codes inline
+ * (legal_form_decoded / registration_authority_decoded) via the same two
+ * lookups, best-effort — a decode failure never blocks the base record.
  *
  * Mapping gotchas (learned live 2026-08-16):
  * - filter[bic] matches 11-character BICs only — an 8-char head-office BIC
@@ -883,6 +890,48 @@ const tools: McpToolExport['tools'] = [
       required: ['jurisdiction'],
     },
   },
+  {
+    name: 'decode_elf_code',
+    description:
+      'Decode an ISO 20275 Entity Legal Form (ELF) code to its registered name, language, country and jurisdiction. ' +
+      'This is the 4-character code GLEIF publishes as `legal_form` on every LEI record (get_lei, search_lei results) — ' +
+      '"XJHM" decodes to Sweden\'s "Aktiebolag", for example. Two sentinel codes carry no country or jurisdiction: ' +
+      '"8888" (no specific legal form recorded — used where the concept does not apply, e.g. some government entities) ' +
+      'and "9999" (legal form not yet classified by the registering LOU); both are flagged via `is_sentinel` rather than ' +
+      'answered as a plain lookup miss. get_lei already decodes this field inline as legal_form_decoded — call this tool ' +
+      'directly only when you have a bare code from elsewhere.',
+    summary: 'The name, country and jurisdiction behind an ISO 20275 entity-legal-form code, from the Global LEI Foundation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '4-character ISO 20275 ELF code, e.g. "XJHM" (Sweden, Aktiebolag) or the sentinel "8888"/"9999". Read it off an LEI record\'s legal_form field — do not guess one.',
+        },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'decode_registration_authority',
+    description:
+      'Decode a GLEIF Registration Authority (RA) code to the national business register\'s name, website and jurisdiction(s). ' +
+      'This is the code GLEIF publishes as `registration_authority` on every LEI record (get_lei, search_lei results), naming ' +
+      'the register that assigned the entity\'s `registered_as` id — "RA000585" decodes to the UK\'s Companies House, for example. ' +
+      'Bare digits are zero-padded and prefixed with "RA" automatically ("585" -> "RA000585"). get_lei already decodes this ' +
+      'field inline as registration_authority_decoded — call this tool directly only when you have a bare code from elsewhere.',
+    summary: 'The national business register behind a GLEIF registration-authority code, from the Global LEI Foundation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: 'GLEIF Registration Authority code, "RA" + 6 digits, e.g. "RA000585" (UK Companies House). Bare digits (e.g. "585") are accepted and normalized.',
+        },
+      },
+      required: ['code'],
+    },
+  },
 ];
 
 function reqStr(args: Record<string, unknown>, key: string, example: string): string {
@@ -921,6 +970,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return groupMembers(gcDb(args), reqStr(args, 'lei', '"W38RGI023J3WT1HWRP32" or a company name like "Siemens"'), args.limit);
     case 'gleif_lei_screen':
       return leiScreen(gcDb(args), args);
+    case 'decode_elf_code':
+      return decodeElfCode(reqStr(args, 'code', '"XJHM" or the sentinel "8888"'));
+    case 'decode_registration_authority':
+      return decodeRegistrationAuthority(reqStr(args, 'code', '"RA000585" or "585"'));
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1029,6 +1082,154 @@ function fmtAddress(a?: { addressLines?: string[]; city?: string; region?: strin
     region: a.region ?? null,
     country: a.country ?? null,
     postal_code: a.postalCode ?? null,
+  };
+}
+
+/* ───────────────────────── ELF / RA code decoders (fleet #3255) ─────────────────────────
+ * GLEIF serves ISO 20275 Entity Legal Forms (ELF, ~3,600 active codes) and its own
+ * Registration Authorities list (RA, ~1,100 codes) as keyed records through the same
+ * api.gleif.org JSON:API the rest of this pack already calls. decode_elf_code and
+ * decode_registration_authority — and get_lei's inline enrichment below — resolve one
+ * code per request against that API; nothing here holds a copy of either list.
+ */
+
+const ELF_SHAPE = /^[A-Z0-9]{4}$/i;
+
+/** The two ISO 20275 sentinel codes carry no country/jurisdiction on GLEIF's own
+ *  record (names[0] comes back all-null) — decode_elf_code would otherwise report
+ *  that as an ordinary lookup miss. Meanings per the ISO 20275 standard itself, not
+ *  GLEIF's API (which has no text for them), so they are two fixed strings, not data. */
+const ELF_SENTINELS: Record<string, string> = {
+  '8888': 'GENERAL — no specific legal form is recorded; used where the concept does not apply (e.g. some government or individual entities). Names no country or jurisdiction.',
+  '9999': 'ENTITY LEGAL FORM NOT IDENTIFIED — the registering LOU has not yet classified this entity\'s legal form. Names no country or jurisdiction.',
+};
+
+function normalizeElfCode(raw: string): string {
+  const v = raw.trim().toUpperCase();
+  if (!ELF_SHAPE.test(v)) {
+    throw new Error(
+      `user_error: "${raw}" is not ELF-code shaped. An ISO 20275 Entity Legal Form code is 4 alphanumeric ` +
+        `characters, e.g. "XJHM" (Sweden, Aktiebolag) or the sentinel "8888"/"9999". Read it off an LEI record's ` +
+        `legal_form field (gleif get_lei) rather than guessing one.`,
+    );
+  }
+  return v;
+}
+
+interface ElfApiRecord {
+  data?: {
+    attributes?: {
+      code?: string;
+      country?: string | null;
+      jurisdiction?: string | null;
+      countryCode?: string | null;
+      subdivisionCode?: string | null;
+      dateCreated?: string | null;
+      status?: string | null;
+      names?: { localName?: string | null; language?: string | null; languageCode?: string | null; transliteratedName?: string | null }[];
+    };
+  };
+}
+
+export async function decodeElfCode(rawCode: string) {
+  const code = normalizeElfCode(rawCode);
+  let data: ElfApiRecord;
+  try {
+    data = (await gleifFetch(`/entity-legal-forms/${encodeURIComponent(code)}`)) as ElfApiRecord;
+  } catch (e) {
+    if (/not found/i.test((e as Error).message)) {
+      throw new Error(
+        `user_error: "${code}" is not a recognized ISO 20275 Entity Legal Form code. GLEIF currently lists ` +
+          `3,600+ active codes; the code on an entity's own record is authoritative — call gleif get_lei and read ` +
+          `its legal_form field rather than guessing a code.`,
+      );
+    }
+    throw e;
+  }
+  const a = data.data?.attributes ?? {};
+  const primary = (a.names ?? [])[0] ?? {};
+  const sentinel = ELF_SENTINELS[code] ?? null;
+  return {
+    code,
+    is_sentinel: sentinel != null,
+    ...(sentinel ? { sentinel_meaning: sentinel } : {}),
+    name: primary.localName ?? null,
+    language: primary.language ?? null,
+    transliterated_name:
+      primary.transliteratedName && primary.transliteratedName !== primary.localName ? primary.transliteratedName : null,
+    country: a.country ?? null,
+    country_code: a.countryCode ?? null,
+    jurisdiction: a.jurisdiction ?? null,
+    subdivision_code: a.subdivisionCode ?? null,
+    status: a.status ?? null,
+    date_added: a.dateCreated ?? null,
+    source: 'GLEIF, ISO 20275 Entity Legal Forms (ELF) code list (CC0)',
+  };
+}
+
+const RA_SHAPE = /^RA[0-9]{6}$/;
+
+/** Bare digits ("585") are a code a caller read off a record without the "RA"
+ *  prefix or the zero padding — normalize rather than reject, since the shape
+ *  is unambiguous once digits-only. */
+function normalizeRaCode(raw: string): string {
+  let v = raw.trim().toUpperCase().replace(/\s+/g, '');
+  if (/^[0-9]{1,6}$/.test(v)) v = `RA${v.padStart(6, '0')}`;
+  if (!RA_SHAPE.test(v)) {
+    throw new Error(
+      `user_error: "${raw}" is not Registration-Authority-code shaped. A GLEIF Registration Authority code is ` +
+        `"RA" followed by 6 digits, e.g. "RA000585" (UK Companies House). Bare digits are zero-padded and ` +
+        `prefixed automatically — read the code off an LEI record's registration_authority field (gleif get_lei) ` +
+        `rather than guessing one.`,
+    );
+  }
+  return v;
+}
+
+interface RaApiRecord {
+  data?: {
+    attributes?: {
+      code?: string;
+      internationalName?: string | null;
+      localName?: string | null;
+      internationalOrganizationName?: string | null;
+      localOrganizationName?: string | null;
+      website?: string | null;
+      jurisdictions?: { country?: string | null; countryCode?: string | null; jurisdiction?: string | null }[];
+    };
+  };
+}
+
+export async function decodeRegistrationAuthority(rawCode: string) {
+  const code = normalizeRaCode(rawCode);
+  let data: RaApiRecord;
+  try {
+    data = (await gleifFetch(`/registration-authorities/${encodeURIComponent(code)}`)) as RaApiRecord;
+  } catch (e) {
+    if (/not found/i.test((e as Error).message)) {
+      throw new Error(
+        `user_error: "${code}" is not a recognized GLEIF Registration Authority code. GLEIF currently lists ` +
+          `1,100+ authorities; the code on an entity's own record is authoritative — call gleif get_lei and read ` +
+          `its registration_authority field rather than guessing a code.`,
+      );
+    }
+    throw e;
+  }
+  const a = data.data?.attributes ?? {};
+  const jurisdictions = (a.jurisdictions ?? []).map((j) => ({
+    country: j.country ?? null,
+    country_code: j.countryCode ?? null,
+    jurisdiction: j.jurisdiction ?? null,
+  }));
+  return {
+    code,
+    name: a.internationalName ?? a.localName ?? a.internationalOrganizationName ?? null,
+    organization_name: a.internationalOrganizationName ?? null,
+    local_organization_name:
+      a.localOrganizationName && a.localOrganizationName !== a.internationalOrganizationName ? a.localOrganizationName : null,
+    website: a.website ?? null,
+    jurisdictions,
+    source: 'GLEIF, Registration Authorities code list (CC0)',
   };
 }
 
@@ -1428,8 +1629,18 @@ async function getLei(rawLei: string) {
   const { lei, resolved } = await resolveLei(rawLei);
   const data = (await gleifFetch(`/lei-records/${encodeURIComponent(lei)}`)) as { data?: LeiRecord };
   if (!data.data) throw new Error(`GLEIF: no record for LEI ${lei}`);
+  const normalized = normalizeRecord(data.data);
+  // Decode legal_form / registration_authority inline, best-effort — a decode
+  // failure (unrecognized code, a transient upstream error) never blocks the
+  // base LEI record; the raw codes are still returned either way.
+  const [legalFormDecoded, registrationAuthorityDecoded] = await Promise.all([
+    normalized.legal_form ? decodeElfCode(normalized.legal_form).catch(() => null) : Promise.resolve(null),
+    normalized.registration_authority ? decodeRegistrationAuthority(normalized.registration_authority).catch(() => null) : Promise.resolve(null),
+  ]);
   return {
-    ...normalizeRecord(data.data),
+    ...normalized,
+    ...(legalFormDecoded ? { legal_form_decoded: legalFormDecoded } : {}),
+    ...(registrationAuthorityDecoded ? { registration_authority_decoded: registrationAuthorityDecoded } : {}),
     ...(resolved ? { resolved_from_name: resolved } : {}),
   };
 }

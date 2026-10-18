@@ -2,12 +2,12 @@
 
 Global Legal Entity Identifier Foundation MCP — LEI lookup, ISIN/BIC-to-entity mapping, and corporate hierarchy, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `search_lei(query, country?, status?, page_size?)` — fuzzy entity-name search. If `country` narrows the result to nothing, the filter is dropped and the response says so via `country_filter_dropped` — GLEIF filters on the *registered legal address*, which often is not where the entity operates (no Sberbank-named record has a Russian one; they sit in CY/SK/LU/GB).
-- `get_lei(lei)` — full Level 1 record: legal name, addresses, jurisdiction, legal form, and LEI registration status. Accepts a company **name** as well as a 20-character LEI; a resolved name is echoed back as `resolved_from_name`.
+- `get_lei(lei)` — full Level 1 record: legal name, addresses, jurisdiction, legal form, and LEI registration status. Accepts a company **name** as well as a 20-character LEI; a resolved name is echoed back as `resolved_from_name`. `legal_form` and `registration_authority` are decoded inline, best-effort, as `legal_form_decoded` / `registration_authority_decoded` (see `decode_elf_code` / `decode_registration_authority` below) — a decode failure never blocks the base record, and the raw codes are always still present.
 
 **`registered_as` + `registration_authority` (on `get_lei` and every
 `search_lei` result).** The company's id in its OWN national business register,
@@ -29,12 +29,16 @@ delta). Null when GLEIF publishes no id — ~7.5% of records.
 - `lei_hierarchy_tree(lei, depth?)` — multi-hop ownership: ancestor chain up to the ultimate parent plus a breadth-first subsidiary tree (depth 1–4, default 2, node budget 150/call).
 - `gleif_group_members(lei, limit?)` — the WHOLE consolidated group in one call, across every jurisdiction. Pass any member (LEI or name); the tool climbs to the ultimate accounting-consolidation parent and returns every entity that reports it, every direct-parent descendant, and their international branches. `member_count`, `jurisdiction_count` and `by_jurisdiction` always cover the full group; the member list is capped at `limit` (default 300, max 2000) and says when it is. Siemens AG: 572 reported subsidiaries, matching GLEIF's own ultimate-children count. Fund-management links are not ownership and are excluded. Carries `data_as_of`.
 - `gleif_lei_screen(jurisdiction, registration_status?, entity_status?, category?, event_type?, since_days?, name_contains?, limit?, offset?)` — bulk screen across all ~3.4M LEIs: e.g. every LEI in `DE` that lapsed in the last 30 days, Delaware (`US-DE`) entities retired this quarter, UK entities whose latest event is a merger. A country code includes its subdivisions. `since_days` applies to `status_date` (LAPSED = the renewal date missed; RETIRED/ANNULLED = entity expiration date, else last update; ISSUED = initial registration) or, with `event_type`, to the event date. `total` is exact up to 100,000. GLEIF records a merger as `RETIRED` plus a `MERGERS_AND_ACQUISITIONS`/`ABSORPTION` event with `successor_lei` — `MERGED` is refused with that explanation rather than answered with zero rows. Sole-proprietor names are withheld in bulk results (they name individuals). Carries `data_as_of`.
+- `decode_elf_code(code)` — decode an ISO 20275 Entity Legal Form code (the 4-character code in `legal_form`) to its registered name, language, country and jurisdiction, e.g. `"XJHM"` → Sweden's "Aktiebolag". The two ISO sentinel codes, `"8888"` (no specific legal form recorded) and `"9999"` (not yet classified), carry no country and are flagged via `is_sentinel` rather than answered as a plain miss.
+- `decode_registration_authority(code)` — decode a GLEIF Registration Authority code (the code in `registration_authority`) to the national business register's name, website and jurisdiction(s), e.g. `"RA000585"` → the UK's Companies House. Bare digits are zero-padded and prefixed with `"RA"` automatically.
 
 ## Data source
 
 `gleif_group_members` and `gleif_lei_screen` answer from the **GLEIF golden copy** (Level 2 relationship records and Level 1 entity reference data, published three times a day at goldencopy.gleif.org), refreshed daily. `data_as_of` in each response is the GLEIF publish time the answer reflects.
 
 **Licence.** GLEIF LEI Data Terms of Use, section II: *"The data available through the Access Service are provided under the CC0 licence"* ([terms](https://www.gleif.org/en/meta/lei-data-terms-of-use), read 2026-09-30).
+
+`decode_elf_code` and `decode_registration_authority` answer per code from GLEIF's own ISO 20275 Entity Legal Forms code list and its Registration Authorities list. `get_lei`'s inline `legal_form_decoded` / `registration_authority_decoded` use the same two lookups.
 
 The other tools:
 
@@ -98,7 +102,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1819+ data sources. The
+Both URLs reach the same gateway and the same 1831+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
